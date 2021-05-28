@@ -315,16 +315,11 @@ def test_historical_features_from_parquet_sources(infer_event_timestamp_col):
         )
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize(
-    "provider_type", ["local", "gcp", "gcp_custom_offline_config"],
-)
+# @pytest.mark.integration
 @pytest.mark.parametrize(
     "infer_event_timestamp_col", [False, True],
 )
-def test_historical_features_from_bigquery_sources(
-    provider_type, infer_event_timestamp_col
-):
+def test_historical_features_from_bigquery_sources(infer_event_timestamp_col):
     start_date = datetime.now().replace(microsecond=0, second=0, minute=0)
     (
         customer_entities,
@@ -375,44 +370,16 @@ def test_historical_features_from_bigquery_sources(
         driver = Entity(name="driver", join_key="driver_id", value_type=ValueType.INT64)
         customer = Entity(name="customer_id", value_type=ValueType.INT64)
 
-        if provider_type == "local":
-            store = FeatureStore(
-                config=RepoConfig(
-                    registry=os.path.join(temp_dir, "registry.db"),
-                    project="default",
-                    provider="local",
-                    online_store=SqliteOnlineStoreConfig(
-                        path=os.path.join(temp_dir, "online_store.db"),
-                    ),
-                    offline_store=BigQueryOfflineStoreConfig(type="bigquery",),
-                )
+        store = FeatureStore(
+            config=RepoConfig(
+                registry=os.path.join(temp_dir, "registry.db"),
+                project="".join(
+                    random.choices(string.ascii_uppercase + string.digits, k=10)
+                ),
+                provider="gcp",
+                offline_store=BigQueryOfflineStoreConfig(type="bigquery",),
             )
-        elif provider_type == "gcp":
-            store = FeatureStore(
-                config=RepoConfig(
-                    registry=os.path.join(temp_dir, "registry.db"),
-                    project="".join(
-                        random.choices(string.ascii_uppercase + string.digits, k=10)
-                    ),
-                    provider="gcp",
-                    offline_store=BigQueryOfflineStoreConfig(type="bigquery",),
-                )
-            )
-        elif provider_type == "gcp_custom_offline_config":
-            store = FeatureStore(
-                config=RepoConfig(
-                    registry=os.path.join(temp_dir, "registry.db"),
-                    project="".join(
-                        random.choices(string.ascii_uppercase + string.digits, k=10)
-                    ),
-                    provider="gcp",
-                    offline_store=BigQueryOfflineStoreConfig(
-                        type="bigquery", dataset="foo"
-                    ),
-                )
-            )
-        else:
-            raise Exception("Invalid provider used as part of test configuration")
+        )
 
         store.apply([driver, customer, driver_fv, customer_fv])
 
