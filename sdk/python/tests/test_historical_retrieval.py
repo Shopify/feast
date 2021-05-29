@@ -316,10 +316,7 @@ def test_historical_features_from_parquet_sources(infer_event_timestamp_col):
 
 
 # @pytest.mark.integration
-@pytest.mark.parametrize(
-    "infer_event_timestamp_col", [False, True],
-)
-def test_historical_features_from_bigquery_sources(infer_event_timestamp_col):
+def test_historical_features_from_bigquery_sources():
     start_date = datetime.now().replace(microsecond=0, second=0, minute=0)
     (
         customer_entities,
@@ -327,7 +324,7 @@ def test_historical_features_from_bigquery_sources(infer_event_timestamp_col):
         end_date,
         orders_df,
         start_date,
-    ) = generate_entities(start_date, infer_event_timestamp_col)
+    ) = generate_entities(start_date, True)
 
     # bigquery_dataset = "test_hist_retrieval_static"
     bigquery_dataset = f"test_hist_retrieval_{int(time.time())}"
@@ -405,11 +402,28 @@ def test_historical_features_from_bigquery_sources(infer_event_timestamp_col):
 
         actual_df_from_sql_entities = job_from_sql.to_df()
 
+        # print(expected_df.iloc[-1])
+        # print(actual_df_from_sql_entities[expected_df.columns].iloc[-1])
+
+        # driver_df = driver_data.create_driver_hourly_stats_df(
+        #     driver_entities, start_date, end_date
+        # )
+        # print(driver_df[driver_df["driver_id"] == expected_df.iloc[-1]["driver_id"]])
+        # customer_df = driver_data.create_customer_daily_profile_df(
+        #     customer_entities, start_date, end_date
+        # )
+        # print(customer_df[customer_df["customer_id"] == expected_df.iloc[-1]["customer_id"]])
+        # print(actual_df_from_sql_entities[actual_df_from_sql_entities["customer_id"] == expected_df.iloc[-1]["customer_id"]])
+        # print(actual_df_from_sql_entities[actual_df_from_sql_entities["driver_id"] == expected_df.iloc[-1]["driver_id"]].iloc[-1])
+
+        # import pdb; pdb.set_trace();
+
+        assert sorted(expected_df.columns) == sorted(actual_df_from_sql_entities.columns)
         assert_frame_equal(
             expected_df.sort_values(
                 by=[event_timestamp, "order_id", "driver_id", "customer_id"]
             ).reset_index(drop=True),
-            actual_df_from_sql_entities.sort_values(
+            actual_df_from_sql_entities[expected_df.columns].sort_values(
                 by=[event_timestamp, "order_id", "driver_id", "customer_id"]
             ).reset_index(drop=True),
             check_dtype=False,
@@ -426,20 +440,16 @@ def test_historical_features_from_bigquery_sources(infer_event_timestamp_col):
             ],
         )
 
-        if provider_type == "gcp_custom_offline_config":
-            # Make sure that custom dataset name is being used from the offline_store config
-            assertpy.assert_that(job_from_df.query).contains("foo.entity_df")
-        else:
-            # If the custom dataset name isn't provided in the config, use default `feast` name
-            assertpy.assert_that(job_from_df.query).contains("feast.entity_df")
+        assertpy.assert_that(job_from_df.query).contains("feast.entity_df")
 
         actual_df_from_df_entities = job_from_df.to_df()
 
+        assert sorted(expected_df.columns) == sorted(actual_df_from_df_entities.columns)
         assert_frame_equal(
             expected_df.sort_values(
                 by=[event_timestamp, "order_id", "driver_id", "customer_id"]
             ).reset_index(drop=True),
-            actual_df_from_df_entities.sort_values(
+            actual_df_from_df_entities[expected_df.columns].sort_values(
                 by=[event_timestamp, "order_id", "driver_id", "customer_id"]
             ).reset_index(drop=True),
             check_dtype=False,

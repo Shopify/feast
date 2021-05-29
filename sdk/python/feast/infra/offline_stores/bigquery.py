@@ -340,113 +340,86 @@ def _get_bigquery_client():
 #   * Create temporary tables instead of keeping all tables in memory
 
 SINGLE_FEATURE_VIEW_POINT_IN_TIME_JOIN = """
-WITH entity_dataframe AS (
-    SELECT ROW_NUMBER() OVER() AS row_number, edf.* FROM {{ left_table_query_string }} as edf
+WITH entity_df AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER() AS entity_df_row_number
+    FROM {{ left_table_query_string }}
 ),
+
 {% for featureview in featureviews %}
-/*
- This query template performs the point-in-time correctness join for a single feature set table
- to the provided entity table.
- 1. Concatenate the timestamp and entities from the feature set table with the entity dataset.
- Feature values are joined to this table later for improved efficiency.
- featureview_timestamp is equal to null in rows from the entity dataset.
- */
-{{ featureview.name }}__union_features AS (
-SELECT
-  -- unique identifier for each row in the entity dataset.
-  row_number,
-  -- event_timestamp contains the timestamps to join onto
-  {{entity_df_event_timestamp_col}} AS event_timestamp,
-  -- the feature_timestamp, i.e. the latest occurrence of the requested feature relative to the entity_dataset timestamp
-  NULL as {{ featureview.name }}_feature_timestamp,
-  -- created timestamp of the feature at the corresponding feature_timestamp
-  {{ 'NULL as created_timestamp,' if featureview.created_timestamp_column else '' }}
-  -- select only entities belonging to this feature set
-  {{ featureview.entities | join(', ')}},
-  -- boolean for filtering the dataset later
-  true AS is_entity_table
-FROM entity_dataframe
-UNION ALL
-SELECT
-  NULL as row_number,
-  {{ featureview.event_timestamp_column }} as event_timestamp,
-  {{ featureview.event_timestamp_column }} as {{ featureview.name }}_feature_timestamp,
-  {{ featureview.created_timestamp_column ~ ' as created_timestamp,' if featureview.created_timestamp_column else '' }}
-  {{ featureview.entity_selections | join(', ')}},
-  false AS is_entity_table
-FROM {{ featureview.table_subquery }} WHERE {{ featureview.event_timestamp_column }} <= '{{ max_timestamp }}'
-{% if featureview.ttl == 0 %}{% else %}AND {{ featureview.event_timestamp_column }} >= Timestamp_sub(TIMESTAMP '{{ min_timestamp }}', interval {{ featureview.ttl }} second){% endif %}
+
+{{ featureview.name }}__base AS (
+    SELECT
+        {{ featureview.event_timestamp_column }} as event_timestamp,
+        {{ featureview.created_timestamp_column ~ ' as created_timestamp,' if featureview.created_timestamp_column else '' }}
+        {% for entity in featureview.entities %} subquery.{{ entity }}, {% endfor %}
+        entity_df.{{entity_df_event_timestamp_col}} AS entity_timestamp,
+        entity_df.entity_df_row_number,
+        {% for feature in featureview.features %}
+            subquery.{{ feature }} as {{ featureview.name }}__{{ feature }}{% if loop.last %}{% else %}, {% endif %}
+        {% endfor %}
+    FROM {{ featureview.table_subquery }} AS subquery
+    INNER JOIN entity_df
+    ON TRUE
+        AND subquery.{{ featureview.event_timestamp_column }} <= entity_df.{{entity_df_event_timestamp_col}}
+
+        {% if featureview.ttl == 0 %}{% else %}
+        AND subquery.{{ featureview.event_timestamp_column }} >= Timestamp_sub(entity_df.{{entity_df_event_timestamp_col}}, interval {{ featureview.ttl }} second)
+        {% endif %}
+
+        {% for entity in featureview.entities %}
+        AND subquery.{{ entity }} = entity_df.{{ entity }}
+        {% endfor %}
 ),
-/*
- 2. Window the data in the unioned dataset, partitioning by entity and ordering by event_timestamp, as
- well as is_entity_table.
- Within each window, back-fill the feature_timestamp - as a result of this, the null feature_timestamps
- in the rows from the entity table should now contain the latest timestamps relative to the row's
- event_timestamp.
- For rows where event_timestamp(provided datetime) - feature_timestamp > max age, set the
- feature_timestamp to null.
- */
-{{ featureview.name }}__joined AS (
-SELECT
-  row_number,
-  event_timestamp,
-  {{ featureview.entities | join(', ')}},
-  {% for feature in featureview.features %}
-  IF(event_timestamp >= {{ featureview.name }}_feature_timestamp {% if featureview.ttl == 0 %}{% else %}AND Timestamp_sub(event_timestamp, interval {{ featureview.ttl }} second) < {{ featureview.name }}_feature_timestamp{% endif %}, {{ featureview.name }}__{{ feature }}, NULL) as {{ featureview.name }}__{{ feature }}{% if loop.last %}{% else %}, {% endif %}
-  {% endfor %}
-FROM (
-SELECT
-  row_number,
-  event_timestamp,
-  {{ featureview.entities | join(', ')}},
-  {{ 'FIRST_VALUE(created_timestamp IGNORE NULLS) over w AS created_timestamp,' if featureview.created_timestamp_column else '' }}
-  FIRST_VALUE({{ featureview.name }}_feature_timestamp IGNORE NULLS) over w AS {{ featureview.name }}_feature_timestamp,
-  is_entity_table
-FROM {{ featureview.name }}__union_features
-WINDOW w AS (PARTITION BY {{ featureview.entities | join(', ') }} ORDER BY event_timestamp DESC, is_entity_table DESC{{', created_timestamp DESC' if featureview.created_timestamp_column else ''}} ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
-)
-/*
- 3. Select only the rows from the entity table, and join the features from the original feature set table
- to the dataset using the entity values, feature_timestamp, and created_timestamps.
- */
-LEFT JOIN (
-SELECT
-  {{ featureview.event_timestamp_column }} as {{ featureview.name }}_feature_timestamp,
-  {{ featureview.created_timestamp_column ~ ' as created_timestamp,' if featureview.created_timestamp_column else '' }}
-  {{ featureview.entity_selections | join(', ')}},
-  {% for feature in featureview.features %}
-  {{ feature }} as {{ featureview.name }}__{{ feature }}{% if loop.last %}{% else %}, {% endif %}
-  {% endfor %}
-FROM {{ featureview.table_subquery }} WHERE {{ featureview.event_timestamp_column }} <= '{{ max_timestamp }}'
-{% if featureview.ttl == 0 %}{% else %}AND {{ featureview.event_timestamp_column }} >= Timestamp_sub(TIMESTAMP '{{ min_timestamp }}', interval {{ featureview.ttl }} second){% endif %}
-) USING ({{ featureview.name }}_feature_timestamp,{{ ' created_timestamp,' if featureview.created_timestamp_column else '' }} {{ featureview.entities | join(', ')}})
-WHERE is_entity_table
+
+{% if featureview.created_timestamp_column %}
+{{ featureview.name }}__dedup AS (
+    SELECT
+        entity_df_row_number,
+        event_timestamp,
+        MAX(created_timestamp) as created_timestamp,
+    FROM {{ featureview.name }}__base
+    GROUP BY entity_df_row_number, event_timestamp
 ),
-/*
- 4. Finally, deduplicate the rows by selecting the first occurrence of each entity table row_number.
- */
-{{ featureview.name }}__deduped AS (SELECT
-  k.*
-FROM (
-  SELECT ARRAY_AGG(row LIMIT 1)[OFFSET(0)] k
-  FROM {{ featureview.name }}__joined row
-  GROUP BY row_number
-)){% if loop.last %}{% else %}, {% endif %}
+{% endif %}
+
+{{ featureview.name }}__latest AS (
+    SELECT
+        entity_df_row_number,
+        MAX(event_timestamp) AS event_timestamp,
+    
+    FROM {{ featureview.name }}__base
+    {% if featureview.created_timestamp_column %}
+        INNER JOIN {{ featureview.name }}__dedup
+        USING (entity_df_row_number, event_timestamp)
+    {% endif %}
+
+    GROUP BY entity_df_row_number
+),
+
+{{ featureview.name }}__cleaned AS (
+    SELECT base.*
+    FROM {{ featureview.name }}__base as base
+    INNER JOIN {{ featureview.name }}__latest USING(entity_df_row_number, event_timestamp)
+){% if loop.last %}{% else %}, {% endif %}
+
 
 {% endfor %}
 /*
  Joins the outputs of multiple time travel joins to a single table.
  */
-SELECT edf.{{entity_df_event_timestamp_col}} as {{entity_df_event_timestamp_col}}, * EXCEPT (row_number, {{entity_df_event_timestamp_col}}) FROM entity_dataframe edf
+
+SELECT * EXCEPT (entity_df_row_number)
+FROM entity_df
 {% for featureview in featureviews %}
 LEFT JOIN (
     SELECT
-    row_number,
+    entity_df_row_number,
     {% for feature in featureview.features %}
-    {{ featureview.name }}__{{ feature }}{% if loop.last %}{% else %}, {% endif %}
+        {{ featureview.name }}__{{ feature }}{% if loop.last %}{% else %}, {% endif %}
     {% endfor %}
-    FROM {{ featureview.name }}__deduped
-) USING (row_number)
+    FROM {{ featureview.name }}__cleaned
+) USING (entity_df_row_number)
 {% endfor %}
-ORDER BY {{entity_df_event_timestamp_col}}
 """
