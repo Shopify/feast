@@ -307,6 +307,7 @@ def build_point_in_time_query(
         "max_timestamp": max_timestamp,
         "left_table_query_string": left_table_query_string,
         "entity_df_event_timestamp_col": entity_df_event_timestamp_col,
+        "unique_entity_keys": set([entity for fv in feature_view_query_contexts for entity in fv.entities]),
         "featureviews": [asdict(context) for context in feature_view_query_contexts],
     }
 
@@ -341,9 +342,14 @@ def _get_bigquery_client():
 
 SINGLE_FEATURE_VIEW_POINT_IN_TIME_JOIN = """
 WITH entity_df AS (
-    SELECT 
+    SELECT
         *,
-        ROW_NUMBER() OVER() AS entity_df_row_number
+        FARM_FINGERPRINT(CONCAT(
+            {% for entity in unique_entity_keys %}
+                CAST({{entity}} AS STRING),
+            {% endfor %}
+            CAST({{entity_df_event_timestamp_col}} AS STRING)
+        )) AS entity_row_unique_id
     FROM {{ left_table_query_string }}
 ),
 
@@ -355,7 +361,7 @@ WITH entity_df AS (
         {{ featureview.created_timestamp_column ~ ' as created_timestamp,' if featureview.created_timestamp_column else '' }}
         {% for entity in featureview.entities %} subquery.{{ entity }}, {% endfor %}
         entity_df.{{entity_df_event_timestamp_col}} AS entity_timestamp,
-        entity_df.entity_df_row_number,
+        entity_df.entity_row_unique_id,
         {% for feature in featureview.features %}
             subquery.{{ feature }} as {{ featureview.name }}__{{ feature }}{% if loop.last %}{% else %}, {% endif %}
         {% endfor %}
@@ -376,32 +382,32 @@ WITH entity_df AS (
 {% if featureview.created_timestamp_column %}
 {{ featureview.name }}__dedup AS (
     SELECT
-        entity_df_row_number,
+        entity_row_unique_id,
         event_timestamp,
         MAX(created_timestamp) as created_timestamp,
     FROM {{ featureview.name }}__base
-    GROUP BY entity_df_row_number, event_timestamp
+    GROUP BY entity_row_unique_id, event_timestamp
 ),
 {% endif %}
 
 {{ featureview.name }}__latest AS (
     SELECT
-        entity_df_row_number,
+        entity_row_unique_id,
         MAX(event_timestamp) AS event_timestamp,
     
     FROM {{ featureview.name }}__base
     {% if featureview.created_timestamp_column %}
         INNER JOIN {{ featureview.name }}__dedup
-        USING (entity_df_row_number, event_timestamp)
+        USING (entity_row_unique_id, event_timestamp)
     {% endif %}
 
-    GROUP BY entity_df_row_number
+    GROUP BY entity_row_unique_id
 ),
 
 {{ featureview.name }}__cleaned AS (
     SELECT base.*
     FROM {{ featureview.name }}__base as base
-    INNER JOIN {{ featureview.name }}__latest USING(entity_df_row_number, event_timestamp)
+    INNER JOIN {{ featureview.name }}__latest USING(entity_row_unique_id, event_timestamp)
 ){% if loop.last %}{% else %}, {% endif %}
 
 
@@ -410,16 +416,16 @@ WITH entity_df AS (
  Joins the outputs of multiple time travel joins to a single table.
  */
 
-SELECT * EXCEPT (entity_df_row_number)
+SELECT * EXCEPT (entity_row_unique_id)
 FROM entity_df
 {% for featureview in featureviews %}
 LEFT JOIN (
     SELECT
-    entity_df_row_number,
+    entity_row_unique_id,
     {% for feature in featureview.features %}
         {{ featureview.name }}__{{ feature }}{% if loop.last %}{% else %}, {% endif %}
     {% endfor %}
     FROM {{ featureview.name }}__cleaned
-) USING (entity_df_row_number)
+) USING (entity_row_unique_id)
 {% endfor %}
 """
