@@ -20,12 +20,8 @@ up:
       meet: gcloud auth application-default login
   - custom:
      name: Google Cloud AI Platform Project
-     met?: gcloud config get-value project | grep -q "ml-platform-adhoc"
-     meet: gcloud config set project ml-platform-adhoc
-  # - custom:
-  #     name: Compile feast
-  #     met?: pip install -e "sdk/python[ci]"
-  #     meet: "true"
+     met?: gcloud config get-value project | grep -q "shopify-data-ml-platform-exp"
+     meet: gcloud config set project shopify-data-ml-platform-exp
 
 commands:
   format:
