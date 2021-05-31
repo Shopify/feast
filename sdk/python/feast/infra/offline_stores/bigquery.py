@@ -341,12 +341,16 @@ def _get_bigquery_client():
 #   * Create temporary tables instead of keeping all tables in memory
 
 SINGLE_FEATURE_VIEW_POINT_IN_TIME_JOIN = """
+/*
+ Compute a deterministic hash for the `left_table_query_string` that will be used throughout
+ all the logic as the field to GROUP BY the data
+*/
 WITH entity_df AS (
     SELECT
         *,
         FARM_FINGERPRINT(CONCAT(
-            {% for entity in unique_entity_keys %}
-                CAST({{entity}} AS STRING),
+            {% for entity_key in unique_entity_keys %}
+                CAST({{entity_key}} AS STRING),
             {% endfor %}
             CAST({{entity_df_event_timestamp_col}} AS STRING)
         )) AS entity_row_unique_id
@@ -355,9 +359,25 @@ WITH entity_df AS (
 
 {% for featureview in featureviews %}
 
+/*
+ This query template performs the point-in-time correctness join for a single feature set table
+ to the provided entity table.
+
+ 1. We first join the current feature_view to the entity dataframe that has been passed.
+ This JOIN has the following logic:
+    - For each row of the entity dataframe, only keep the rows where the `event_timestamp_column`
+    is less than the one provided in the entity dataframe
+    - If there a TTL for the current feature_view, also keep the rows where the `event_timestamp_column`
+    is higher the the one provided minus the TTL
+    - For each row, Join on the entity key and retrieve the `entity_row_unique_id` that has been
+    computed previously
+
+ The output of this CTE will contain all the necessary information and already filtered out most
+ of the data that is not relevant.
+*/
 {{ featureview.name }}__base AS (
     SELECT
-        {{ featureview.event_timestamp_column }} as event_timestamp,
+        subquery.{{ featureview.event_timestamp_column }} as event_timestamp,
         {{ featureview.created_timestamp_column ~ ' as created_timestamp,' if featureview.created_timestamp_column else '' }}
         {% for entity in featureview.entities %} subquery.{{ entity }}, {% endfor %}
         entity_df.{{entity_df_event_timestamp_col}} AS entity_timestamp,
@@ -379,6 +399,12 @@ WITH entity_df AS (
         {% endfor %}
 ),
 
+/*
+ 2. If the `created_timestamp_column` has been set, we need to
+ deduplicate the data first. This is done by calculating the
+ `MAX(created_at_timestamp)` for each event_timestamp.
+ We then join the data on the next CTE
+*/
 {% if featureview.created_timestamp_column %}
 {{ featureview.name }}__dedup AS (
     SELECT
@@ -390,30 +416,49 @@ WITH entity_df AS (
 ),
 {% endif %}
 
+/*
+ 3. The data has been filtered during the first CTE "*__base"
+ Thus we only need to compute the latest timestamp of each feature.
+*/
 {{ featureview.name }}__latest AS (
     SELECT
         entity_row_unique_id,
-        MAX(event_timestamp) AS event_timestamp,
+        MAX(event_timestamp) AS event_timestamp
+        {% if featureview.created_timestamp_column %}
+            ,ANY_VALUE(created_timestamp) AS created_timestamp
+        {% endif %}
     
     FROM {{ featureview.name }}__base
     {% if featureview.created_timestamp_column %}
         INNER JOIN {{ featureview.name }}__dedup
-        USING (entity_row_unique_id, event_timestamp)
+        USING (entity_row_unique_id, event_timestamp, created_timestamp)
     {% endif %}
 
     GROUP BY entity_row_unique_id
 ),
 
+/*
+ 4. Once we know the latest value of each feature for a given timestamp,
+ we can join again the data back to the original "base" dataset
+*/
 {{ featureview.name }}__cleaned AS (
     SELECT base.*
     FROM {{ featureview.name }}__base as base
-    INNER JOIN {{ featureview.name }}__latest USING(entity_row_unique_id, event_timestamp)
+    INNER JOIN {{ featureview.name }}__latest
+    USING(
+        entity_row_unique_id,
+        event_timestamp
+        {% if featureview.created_timestamp_column %}
+            ,created_timestamp
+        {% endif %}
+    )
 ){% if loop.last %}{% else %}, {% endif %}
 
 
 {% endfor %}
 /*
  Joins the outputs of multiple time travel joins to a single table.
+ The entity_df dataset being our source of truth here.
  */
 
 SELECT * EXCEPT (entity_row_unique_id)
@@ -421,10 +466,10 @@ FROM entity_df
 {% for featureview in featureviews %}
 LEFT JOIN (
     SELECT
-    entity_row_unique_id,
-    {% for feature in featureview.features %}
-        {{ featureview.name }}__{{ feature }}{% if loop.last %}{% else %}, {% endif %}
-    {% endfor %}
+        entity_row_unique_id,
+        {% for feature in featureview.features %}
+            {{ featureview.name }}__{{ feature }},
+        {% endfor %}
     FROM {{ featureview.name }}__cleaned
 ) USING (entity_row_unique_id)
 {% endfor %}
