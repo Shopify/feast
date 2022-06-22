@@ -295,7 +295,7 @@ mypy-protobuf==1.24
     # via feast (setup.py)
 nodeenv==1.6.0
     # via pre-commit
-numpy==1.22.1
+numpy==1.22.0
     # via
     #   pandas
     #   pandavro
