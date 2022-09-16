@@ -314,7 +314,7 @@ numpy==1.21.5
     #   pandas
     #   pandavro
     #   pyarrow
-oauthlib==3.1.1
+oauthlib==3.2.1
     # via requests-oauthlib
 packaging==21.3
     # via
