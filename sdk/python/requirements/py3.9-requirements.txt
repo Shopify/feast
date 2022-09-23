@@ -76,7 +76,7 @@ pandavro==1.5.2
     # via feast (setup.py)
 proto-plus==1.19.6
     # via feast (setup.py)
-protobuf==3.19.3
+protobuf==3.19.5
     # via
     #   feast (setup.py)
     #   google-api-core
